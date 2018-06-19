@@ -1,3 +1,4 @@
+123
 /**
  * (C) Copyright IBM Corp. 2015, 2016
  *
@@ -27,6 +28,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
@@ -37,6 +39,7 @@ import org.apache.hadoop.util.Progressable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.net.UrlEscapers;
 import com.ibm.stocator.fs.common.Constants;
 import com.ibm.stocator.fs.common.IStoreClient;
 import com.ibm.stocator.fs.common.ObjectStoreGlobber;
@@ -48,6 +51,8 @@ import static com.ibm.stocator.fs.common.Constants.HADOOP_ATTEMPT;
 import static com.ibm.stocator.fs.common.Constants.HADOOP_TEMPORARY;
 import static com.ibm.stocator.fs.common.Constants.OUTPUT_COMMITTER_TYPE;
 import static com.ibm.stocator.fs.common.Constants.DEFAULT_FOUTPUTCOMMITTER_V1;
+import static com.ibm.stocator.fs.common.Constants.FS_STOCATOR_GLOB_BRACKET_SUPPORT;
+import static com.ibm.stocator.fs.common.Constants.FS_STOCATOR_GLOB_BRACKET_SUPPORT_DEFAULT;
 
 /**
  * Object store driver implementation
@@ -75,6 +80,7 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
    */
   private URI uri;
   private StocatorPath stocatorPath;
+  private boolean bracketGlobSupport;
 
   @Override
   public String getScheme() {
@@ -88,9 +94,12 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
     if (!conf.getBoolean("mapreduce.fileoutputcommitter.marksuccessfuljobs", true)) {
       throw new IOException("mapreduce.fileoutputcommitter.marksuccessfuljobs should be enabled");
     }
-    uri = URI.create(fsuri.getScheme() + "://" + fsuri.getAuthority());
+    String escapedAuthority = UrlEscapers.urlPathSegmentEscaper().escape(fsuri.getAuthority());
+    uri = URI.create(fsuri.getScheme() + "://" + escapedAuthority);
     setConf(conf);
     String committerType = conf.get(OUTPUT_COMMITTER_TYPE, DEFAULT_FOUTPUTCOMMITTER_V1);
+    bracketGlobSupport = conf.getBoolean(FS_STOCATOR_GLOB_BRACKET_SUPPORT,
+        FS_STOCATOR_GLOB_BRACKET_SUPPORT_DEFAULT.equals("true"));
     if (storageClient == null) {
       storageClient = ObjectStoreVisitor.getStoreClient(fsuri, conf);
       if (Utils.validSchema(fsuri.toString())) {
@@ -141,7 +150,7 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
     Path path = storageClient.qualify(f);
     try {
       FileStatus fileStatus = getFileStatus(path);
-      LOG.debug("is directory: {}" + path.toString() + " " + fileStatus.isDirectory());
+      LOG.debug("is directory: {} : {}", path.toString(), fileStatus.isDirectory());
       return fileStatus.isDirectory();
     } catch (FileNotFoundException e) {
       return false;
@@ -206,10 +215,11 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
    * /part-r-00019-a08dcbab-8a34-4d80-a51c-368a71db90aa.csv-attempt_201603131849_0000_m_000019_0
    *
    */
-  public FSDataOutputStream create(Path f, FsPermission permission,
+  public FSDataOutputStream  create(Path f, FsPermission permission,
       boolean overwrite, int bufferSize,
       short replication, long blockSize, Progressable progress) throws IOException {
     LOG.debug("Create: {}, overwrite is: {}", f.toString(), overwrite);
+    validateBracketSupport(f.toString());
     Path path = storageClient.qualify(f);
     String objNameModified = "";
     // check if request is dataroot/objectname/_SUCCESS
@@ -347,9 +357,10 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
     FileStatus fileStatus = null;
     if (isDirectory == null) {
       try {
+        LOG.trace("listStatus: internal get status-start for {}", f);
         fileStatus = getFileStatus(f);
         if (fileStatus != null) {
-          LOG.trace("listStatus for {} completed,  directory : {}", f.toString(),
+          LOG.trace("listStatus: internal get status-finish for {}. Directory {}", f.toString(),
               fileStatus.isDirectory());
           if (fileStatus.isDirectory()) {
             isDirectory = Boolean.TRUE;
@@ -362,28 +373,28 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
       }
     }
     // we need this,since ObjectStoreGlobber may send prefix
-    // container/objectperfix* and objectperfix is not exists as an object or
+    // container/objectprefix* and objectprefix is not exists as an object or
     // pseudo directory
     if (fileStatus != null && !(prefixBased || (isDirectory != null && isDirectory))) {
-      LOG.debug("listStatus: {} is not a directory, but a file. Return single result",
+      LOG.debug("listStatus: {} is not a directory, but a file. Return single element",
           f.toString());
       FileStatus[] stats = new FileStatus[1];
       stats[0] = fileStatus;
       return stats;
     }
-    LOG.debug("listStatus: {} is not exiists, prefix based listing set to {}. Perform list",
+    LOG.debug("listStatus: {} -not found. Prefix based listing set to {}. Perform list",
         f.toString(), prefixBased);
     Path path = storageClient.qualify(f);
     if (!storageClient.isFlatListing()) {
-      LOG.debug("Using s3a style, non flat list. Requested via configuration flag for {}",
-          f);
+      LOG.trace("Using hadoop list style, non flat list {}", f);
       listing =  storageClient.list(hostNameScheme, path, false, prefixBased,
           isDirectory, storageClient.isFlatListing(), filter);
     } else {
+      LOG.trace("Using stocator list style, flat list {}", f);
       listing = storageClient.list(hostNameScheme, path, false, prefixBased, isDirectory,
           storageClient.isFlatListing(), filter);
     }
-    LOG.debug("listStatus: {} list completed with {} results", path.toString(),
+    LOG.debug("listStatus: {} completed. return {} results", path.toString(),
         listing.length);
     return listing;
   }
@@ -431,13 +442,33 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
    *
    */
   @Override
-  public boolean mkdirs(Path f) throws IOException {
+  public boolean mkdirs(Path f) throws IOException, FileAlreadyExistsException {
     LOG.debug("mkdirs: {}", f.toString());
+    validateBracketSupport(f.toString());
     if (stocatorPath.isTemporaryPathTarget(f.getParent())) {
       Path path = storageClient.qualify(f);
       String objNameModified = stocatorPath.getObjectNameRoot(path,true,
           storageClient.getDataRoot(), true);
       Path pathToObj = new Path(objNameModified);
+      LOG.trace("mkdirs {} modified name", objNameModified);
+      // make sure there is no overwrite of existing data
+      // if we here, means getfilestatus() returned false and
+      // fileoutputcomitter is about to create job temp folder
+      // in this case there is no need to check wether base directory exists
+      // as it was already checked in getfilestatus() method
+      /*
+      try {
+        String directoryToExpect = stocatorPath.getBaseDirectory(f.toString());
+        FileStatus fileStatus = getFileStatus(new Path(directoryToExpect));
+        if (fileStatus != null) {
+          LOG.debug("mkdirs found {} as exists. Directory : {}", directoryToExpect,
+              fileStatus.isDirectory());
+          throw new FileAlreadyExistsException("mkdir on existing directory " + directoryToExpect);
+        }
+      } catch (FileNotFoundException e) {
+        LOG.debug("mkdirs {} - not exists. Proceed", pathToObj.getParent().toString());
+      }
+      */
       String plainObjName = pathToObj.getParent().toString();
       LOG.debug("Going to create identifier {}", plainObjName);
       Map<String, String> metadata = new HashMap<String, String>();
@@ -484,13 +515,13 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
   @Override
   public FileStatus[] globStatus(Path pathPattern) throws IOException {
     LOG.debug("Glob status: {}", pathPattern.toString());
-    return new ObjectStoreGlobber(this, pathPattern, DEFAULT_FILTER).glob();
+    return new ObjectStoreGlobber(this, pathPattern, DEFAULT_FILTER, bracketGlobSupport).glob();
   }
 
   @Override
   public FileStatus[] globStatus(Path pathPattern, PathFilter filter) throws IOException {
     LOG.debug("Glob status {} with path filter {}",pathPattern.toString(), filter.toString());
-    return new ObjectStoreGlobber(this, pathPattern, filter).glob();
+    return new ObjectStoreGlobber(this, pathPattern, filter, bracketGlobSupport).glob();
   }
 
   @Override
@@ -530,6 +561,14 @@ public class ObjectStoreFileSystem extends ExtendedFileSystem {
       return true;
     }
   };
+
+  private void validateBracketSupport(String path) throws IOException {
+    if (path != null && bracketGlobSupport && path.indexOf("{") > 0 && path.indexOf("}") > 0) {
+      LOG.debug("Bracket glob support: {}. Path {} can not contain brackets",
+          bracketGlobSupport, path);
+      throw new IOException("Bracket glob support enabled. Path can not contain brackets " + path);
+    }
+  }
 
   @Override
   public String getHostnameScheme() {

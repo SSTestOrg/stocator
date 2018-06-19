@@ -36,15 +36,16 @@ import org.powermock.reflect.Whitebox;
 import com.ibm.stocator.fs.ObjectStoreFileSystem;
 import com.ibm.stocator.fs.common.Constants;
 import com.ibm.stocator.fs.common.StocatorPath;
+import com.ibm.stocator.fs.common.FileSystemTestUtils;
 
 public class ObjectStoreFileSystemTest extends SwiftBaseTest {
 
   private ObjectStoreFileSystem mMockObjectStoreFileSystem;
   private StocatorPath mMockStocatorPath;
   private String hostName = "swift2d://out1003.lvm";
-  protected byte[] data = SwiftTestUtils.generateDataset(getBlockSize() * 2, 0, 255);
-  String fileName = null;
-  int iterNum = 3;
+  private byte[] data = FileSystemTestUtils.generateDataset(getBlockSize() * 2, 0, 255);
+  private String fileName = null;
+  private int iterNum = 3;
 
   @Before
   public final void before() throws Exception {
@@ -125,7 +126,7 @@ public class ObjectStoreFileSystemTest extends SwiftBaseTest {
   }
 
   @Test
-  public void getSchemeTest() throws Exception {
+  public void getSchemeTest() {
     Assume.assumeNotNull(getFs());
     Assert.assertEquals(Constants.SWIFT2D, getFs().getScheme());
   }
